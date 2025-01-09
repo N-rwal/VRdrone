@@ -24,6 +24,7 @@ try:
         message_count += 1
 
         # sends a message every 5th received message, may need to be increased
+        # currently it uses a random value generato for testing purposes
         if message_count % 5 == 0:
             value1 = random.randint(0, 255)
             value2 = random.randint(0, 255)
