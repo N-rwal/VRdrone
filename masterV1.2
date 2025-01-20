@@ -1,0 +1,150 @@
+from multiprocessing import Process, Queue
+import RPi.GPIO as GPIO
+import socket
+import struct
+import time
+import smbus
+
+"""=================================================UDP&I2C SETUP=================================================="""
+UDP_IP = "0.0.0.0"
+UDP_PORT = 5005
+HEADSET_IP = "192.168.0.107"
+HEADSET_PORT = 5006
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+
+bus = smbus.SMBus(1)  # Bus i2c 1
+SRF10_ADDRESS = 0x70
+SRF10_ADDRESS1 = 0x71  # default addr
+SRF10_ADDRESS2 = 0x72
+SRF10_ADDRESS3 = 0x73
+
+print(f"listening for data on {UDP_IP}:{UDP_PORT}...")
+
+"""=================================================GPIO SETUP=================================================="""
+motor1_pin = 23
+motor2_pin = 26
+M1 = 21
+M2 = 20
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(motor1_pin, GPIO.OUT)
+GPIO.setup(motor2_pin, GPIO.OUT)
+GPIO.setup(M1, GPIO.OUT)
+GPIO.setup(M2, GPIO.OUT)
+
+pwm_motor1 = GPIO.PWM(motor1_pin, 400) #400 Hz PWM
+pwm_motor2 = GPIO.PWM(motor2_pin, 400)
+
+pwm_motor1.start(0)
+pwm_motor2.start(0)
+
+def set_speed(speed_motor1, speed_motor2):
+    pwm_motor1.ChangeDutyCycle(speed_motor1)
+    pwm_motor2.ChangeDutyCycle(speed_motor2)
+
+"""=================================================SENSOR PROCESS=================================================="""
+def sensor_process(sensor_queue):
+    try:
+        while True:
+            try:
+                # Read all sensors
+                bus.write_byte_data(SRF10_ADDRESS, 0x00, 0x51)
+                time.sleep(0.07)
+                msb = bus.read_byte_data(SRF10_ADDRESS, 0x02)
+                lsb = bus.read_byte_data(SRF10_ADDRESS, 0x03)
+                distance0 = (msb << 8) + lsb
+
+                bus.write_byte_data(SRF10_ADDRESS1, 0x00, 0x51)
+                time.sleep(0.07)
+                msb = bus.read_byte_data(SRF10_ADDRESS1, 0x02)
+                lsb = bus.read_byte_data(SRF10_ADDRESS1, 0x03)
+                distance1 = (msb << 8) + lsb
+
+                bus.write_byte_data(SRF10_ADDRESS2, 0x00, 0x51)
+                time.sleep(0.07)
+                msb = bus.read_byte_data(SRF10_ADDRESS2, 0x02)
+                lsb = bus.read_byte_data(SRF10_ADDRESS2, 0x03)
+                distance2 = (msb << 8) + lsb
+
+                bus.write_byte_data(SRF10_ADDRESS3, 0x00, 0x51)
+                time.sleep(0.07)
+                msb = bus.read_byte_data(SRF10_ADDRESS3, 0x02)
+                lsb = bus.read_byte_data(SRF10_ADDRESS3, 0x03)
+                distance3 = (msb << 8) + lsb
+
+                sensor_queue.put((distance0, distance1, distance2, distance3))
+            except Exception as e:
+                print(f"Sensor error: {e}")
+                sensor_queue.put((None, None, None, None))
+    finally:
+        print("Sensor process shutting down")
+
+"""=================================================MAIN PROCESS=================================================="""
+def pilot(cmd1, cmd2):
+    if cmd1 < 0:
+        GPIO.output(M1, GPIO.HIGH)
+        cmd1_scaled = int(-cmd1)
+    else:
+        GPIO.output(M1, GPIO.LOW)
+        cmd1_scaled = int(cmd1)
+
+    if cmd2 < 0:
+        GPIO.output(M2, GPIO.HIGH)
+        cmd2_scaled = int(-cmd2)
+    else:
+        GPIO.output(M2, GPIO.LOW)
+        cmd2_scaled = int(cmd2)
+
+    set_speed(cmd1_scaled, cmd2_scaled)
+
+if __name__ == "__main__":
+    # Create a queue to share sensor data between processes
+    sensor_queue = Queue()
+
+    # Start the sensor process
+    sensor_proc = Process(target=sensor_process, args=(sensor_queue,))
+    sensor_proc.start()
+
+    try:
+        set_speed(0, 0)  # Begin at 0
+        message_count = 0
+        cmd1_previous = 0.0
+        cmd2_previous = 0.0
+
+        while True:
+            # Receive pilot commands
+            data, addr = sock.recvfrom(1024)
+            data_str = data.decode('utf-8')
+            x_str, y_str = data_str.split(',')
+            cmd1 = float(x_str) * 100
+            cmd2 = float(y_str) * 100
+
+            cmd1_smoothed = (cmd1 * 0.05) + (cmd1_previous * 0.90)
+            cmd1_previous = cmd1_smoothed
+            cmd2_smoothed = (cmd2 * 0.05) + (cmd2_previous * 0.90)
+            cmd2_previous = cmd2_smoothed
+
+            pilot(cmd1_smoothed, cmd2_smoothed)
+            message_count += 1
+
+            # Every 20 messages, get the latest sensor data and send it
+            if message_count % 20 == 0:
+                if not sensor_queue.empty():
+                    distances = sensor_queue.get()
+                    if all(d is not None for d in distances):
+                        message_to_send = struct.pack('BBBB', *distances)
+                        sock.sendto(message_to_send, (HEADSET_IP, HEADSET_PORT))
+                    else:
+                        print("Sensor data unavailable")
+    except KeyboardInterrupt:
+        print("Program shutdown")
+    finally:
+        # Shutdown logic
+        set_speed(0, 0)
+        GPIO.cleanup()
+        sock.close()
+        sensor_proc.terminate()
+        sensor_proc.join()
+        print("All processes terminated")
